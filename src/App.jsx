@@ -9,6 +9,11 @@ import {
 const nhlFetch = (path) => fetch(`/.netlify/functions/nhl?path=${encodeURIComponent(path)}`)
   .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
 
+// Same idea for the AHL's HockeyTech feed: `params` are the feed parameters,
+// e.g. { feed: 'modulekit', view: 'seasons' }. The proxy adds the site key.
+const ahlFetch = (params) => fetch(`/.netlify/functions/ahl?${new URLSearchParams(params)}`)
+  .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+
 const PlayerClickContext = createContext(() => {});
 const usePlayerClick = () => useContext(PlayerClickContext);
 
@@ -18,6 +23,7 @@ const ACCENT = '#0b5cad';
 const BRAND = '#0b2545';
 const LIVE = '#dc2626';
 const PUCK_ORANGE = '#f97316';
+const AHL_RED = '#c8102e';
 const RADIUS = { sm: 8, md: 12, lg: 16, xl: 20, pill: 999 };
 const SHADOW = {
   sm: '0 1px 2px rgba(15,23,42,0.05)',
@@ -186,32 +192,36 @@ const rowHover = {
   onMouseLeave: e => { e.currentTarget.style.background = 'transparent'; },
 };
 
-function NhlBadge({ size = 22 }) {
+function LeagueBadge({ league, size = 22 }) {
+  const ahl = league === 'ahl';
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-      background: BRAND, color: '#fff', fontWeight: 900, fontSize: size * 0.5,
+      background: ahl ? '#111827' : BRAND, color: '#fff', fontWeight: 900, fontSize: size * 0.5,
       letterSpacing: '0.04em', borderRadius: 6, padding: `${size * 0.18}px ${size * 0.32}px`,
-      border: `2px solid ${PUCK_ORANGE}`,
+      border: `2px solid ${ahl ? AHL_RED : PUCK_ORANGE}`,
     }}>
-      NHL
+      {ahl ? 'AHL' : 'NHL'}
+    </span>
+  );
+}
+
+function StatusBadge({ live, final, text }) {
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4,
+      fontSize: 10, fontWeight: 800, letterSpacing: '0.05em', textTransform: 'uppercase',
+      color: live ? '#fff' : final ? 'var(--text2)' : ACCENT,
+      background: live ? LIVE : 'var(--surface2)',
+      padding: '2px 8px', borderRadius: RADIUS.pill, whiteSpace: 'nowrap',
+    }}>
+      {live && <Radio size={9} />} {text}
     </span>
   );
 }
 
 function StatusPill({ game }) {
-  const live = isLive(game);
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', gap: 4,
-      fontSize: 10, fontWeight: 800, letterSpacing: '0.05em', textTransform: 'uppercase',
-      color: live ? '#fff' : isFinal(game) ? 'var(--text2)' : ACCENT,
-      background: live ? LIVE : 'var(--surface2)',
-      padding: '2px 8px', borderRadius: RADIUS.pill, whiteSpace: 'nowrap',
-    }}>
-      {live && <Radio size={9} />} {gameStatusText(game)}
-    </span>
-  );
+  return <StatusBadge live={isLive(game)} final={isFinal(game)} text={gameStatusText(game)} />;
 }
 
 function Headshot({ src, size = 40, style }) {
@@ -1572,8 +1582,1168 @@ function HomePage({ standings, games, dateStr, teamMap, onGameClick, onTeamClick
   );
 }
 
+// ─── AHL ────────────────────────────────────────────────────────────────────
+// AHL data comes from HockeyTech's LeagueStat feed (netlify/functions/ahl.js).
+// Its shapes differ from the NHL API (every value arrives as a string, teams
+// are keyed by numeric id, records are W-L-OTL-SOL), so the AHL views get
+// their own components built from the same design pieces as the NHL ones.
+// Logo file names vary by team and season (309.png, 317_90.png, ...), so the
+// dashboard loads the real URLs from the season's team list and hands them
+// down through context; the plain id URL is only a fallback.
+const ahlLogoFallback = (teamId) => (teamId ? `https://assets.leaguestat.com/ahl/logos/${teamId}.png` : '');
+const AhlLogoContext = createContext({});
+const useAhlLogo = () => {
+  const logos = useContext(AhlLogoContext);
+  return (teamId) => logos[teamId] ?? ahlLogoFallback(teamId);
+};
+const ahlHeadshot = (playerId) => (playerId ? `https://assets.leaguestat.com/ahl/240x240/${playerId}.jpg` : '');
+const ahlKit = (view, params = {}) => ahlFetch({ feed: 'modulekit', view, ...params }).then(d => d.SiteKit ?? {});
+const ahlRecord = (t) => (t ? `${t.wins}-${t.losses}-${t.ot_losses}-${t.shootout_losses}` : '');
+const ahlName = (p) => (p ? `${p.first_name} ${p.last_name}` : '');
+const ahlHeight = (h) => (h ? `${h.replace('-', "'")}"` : '—');
+// "00:08:05" → "8:05"
+const ahlClock = (t) => (t ?? '').replace(/^00:/, '').replace(/^0(\d:)/, '$1');
+const ahlPeriodName = (sum, pid) => ({ 1: 'First Period', 2: 'Second Period', 3: 'Third Period' }[pid]
+  ?? (sum?.periods?.[pid]?.long_name === 'OT' ? 'Overtime' : sum?.periods?.[pid]?.long_name ?? `Period ${pid}`));
+
+// The day's games and a team's schedule share most field names.
+// status: 1 scheduled, 2 in progress, 3 unofficial final, 4 final.
+function normAhlGame(g) {
+  const status = Number(g.status);
+  const side = (pre, idKey) => ({
+    id: g[idKey], code: g[`${pre}_team_code`], name: g[`${pre}_team_name`],
+    score: Number(g[`${pre}_goal_count`] ?? 0), shots: g[`${pre}_shots`] != null ? Number(g[`${pre}_shots`]) : null,
+  });
+  return {
+    id: g.game_id ?? g.id, date: g.date_played, status, statusText: g.game_status,
+    live: status === 2, final: status >= 3, started: status >= 2,
+    venue: g.venue ?? g.venue_name, playoff: g.playoff === '1',
+    away: side('visiting', 'visiting_team'), home: side('home', 'home_team'),
+    goals: Array.isArray(g.goal_list) ? g.goal_list : [],
+  };
+}
+
+function AhlTeamLine({ team, teamMap, showScore, winner }) {
+  const ahlLogo = useAhlLogo();
+  const info = teamMap[team.id];
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+        <img src={ahlLogo(team.id)} style={{ width: 32, height: 32, objectFit: 'contain', flexShrink: 0 }} alt="" />
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: winner ? 900 : 700, fontSize: 15, color: winner ? 'var(--text)' : 'var(--text2)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {team.name ?? info?.name ?? team.code}
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text4)' }}>
+            {info ? `${ahlRecord(info)} · ${info.points} pts` : team.code}
+            {showScore && team.shots > 0 && <span> · {team.shots} SOG</span>}
+          </div>
+        </div>
+      </div>
+      <div style={{ fontSize: 24, fontWeight: 900, fontFamily: MONO, color: winner ? ACCENT : 'var(--text)', flexShrink: 0, marginLeft: 8 }}>
+        {showScore ? team.score : <span style={{ fontSize: 12, color: 'var(--text4)' }}>—</span>}
+      </div>
+    </div>
+  );
+}
+
+function AhlGameCard({ game, teamMap, onClick }) {
+  const ahlLogo = useAhlLogo();
+  const { away, home } = game;
+  const idByCode = { [away.code]: away.id, [home.code]: home.id };
+  const goals = game.goals;
+  return (
+    <div onClick={onClick} style={{ ...S.card, padding: '12px 14px', cursor: 'pointer', transition: 'box-shadow 0.15s, transform 0.15s' }} {...liftHover}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, gap: 8 }}>
+        <StatusBadge live={game.live} final={game.final} text={game.statusText} />
+        <span style={{ fontSize: 10, color: 'var(--text4)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{game.venue}</span>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <AhlTeamLine team={away} teamMap={teamMap} showScore={game.started} winner={game.final && away.score > home.score} />
+        <AhlTeamLine team={home} teamMap={teamMap} showScore={game.started} winner={game.final && home.score > away.score} />
+      </div>
+      {goals.length > 0 && (
+        <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${LINE}`, display: 'flex', flexDirection: 'column', gap: 3 }}>
+          {goals.slice(-5).map((g, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--text2)' }}>
+              <span style={{ fontFamily: MONO, color: 'var(--text4)', width: 58, flexShrink: 0 }}>{g.short_name === 'OT' ? 'OT' : ordinal(Number(g.period_id))} {ahlClock(g.time)}</span>
+              <img src={ahlLogo(idByCode[g.code])} style={{ width: 14, height: 14, objectFit: 'contain' }} alt="" />
+              <span style={{ fontWeight: 700, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {g.first_name} {g.actual_last_name ?? g.last_name}
+              </span>
+              {g.power_play === '1' && <span style={{ fontSize: 9, fontWeight: 800, color: PUCK_ORANGE }}>PP</span>}
+              {g.short_handed === '1' && <span style={{ fontSize: 9, fontWeight: 800, color: PUCK_ORANGE }}>SH</span>}
+              {g.empty_net === '1' && <span style={{ fontSize: 9, fontWeight: 800, color: 'var(--text3)' }}>EN</span>}
+            </div>
+          ))}
+          {goals.length > 5 && <div style={{ fontSize: 10, color: 'var(--text4)' }}>+{goals.length - 5} earlier goal{goals.length - 5 === 1 ? '' : 's'}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── AHL game center ────────────────────────────────────────────────────────
+function AhlLineScore({ sum }) {
+  const ahlLogo = useAhlLogo();
+  const pids = Object.keys(sum?.goalsByPeriod?.visitor ?? {});
+  if (pids.length === 0) return null;
+  const shots = sum.shotsByPeriod ?? {};
+  return (
+    <div style={{ overflowX: 'auto', marginBottom: 16 }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+        <thead>
+          <tr style={{ background: 'var(--surface2)' }}>
+            <th style={{ ...S.th, textAlign: 'left' }}>Team</th>
+            {pids.map(pid => <th key={pid} style={S.th}>{sum.periods?.[pid]?.long_name ?? pid}</th>)}
+            <th style={{ ...S.th, borderLeft: `1px solid ${LINE2}` }}>G</th>
+            <th style={S.th}>SOG</th>
+          </tr>
+        </thead>
+        <tbody>
+          {[['visitor', sum.visitor], ['home', sum.home]].map(([side, team]) => (
+            <tr key={side} style={{ borderTop: `1px solid ${LINE}` }}>
+              <td style={{ ...S.td, textAlign: 'left', fontFamily: 'inherit', fontWeight: 700, color: 'var(--text)' }}>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <img src={ahlLogo(team?.id)} style={{ width: 18, height: 18, objectFit: 'contain' }} alt="" />{team?.code}
+                </span>
+              </td>
+              {pids.map(pid => <td key={pid} style={S.td}>{sum.goalsByPeriod[side]?.[pid] ?? '—'}</td>)}
+              <td style={{ ...S.td, borderLeft: `1px solid ${LINE2}`, fontWeight: 900, color: 'var(--text)' }}>{sum.totalGoals?.[side] ?? '—'}</td>
+              <td style={S.td}>{sum.totalShots?.[side] ?? Object.values(shots[side] ?? {}).reduce((a, b) => a + Number(b), 0)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AhlThreeStars({ sum }) {
+  const stars = (sum?.mvps ?? []).filter(s => s.player_id);
+  if (stars.length === 0) return null;
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 8, marginBottom: 16 }}>
+      {stars.map((s, i) => {
+        const team = Number(s.home) ? sum.home : sum.visitor;
+        return (
+          <div key={s.player_id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: 10, border: `1px solid ${LINE}`, borderRadius: RADIUS.md, background: 'var(--surface2)' }}>
+            <Headshot src={ahlHeadshot(s.player_id)} size={40} />
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 10, fontWeight: 800, color: PUCK_ORANGE, textTransform: 'uppercase', letterSpacing: '0.05em' }}>★ {ordinal(i + 1)} Star</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                <PlayerName id={s.player_id}>{ahlName(s)}</PlayerName>
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text3)' }}>{team?.code} · #{s.jersey_number}</div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+const periodHeading = { fontSize: 11, fontWeight: 800, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.08em', padding: '4px 0', borderBottom: `1px solid ${LINE}` };
+const flagChip = (text, bg = PUCK_ORANGE, color = '#fff') => (
+  <span style={{ marginLeft: 6, fontSize: 9, fontWeight: 800, color, background: bg, padding: '1px 5px', borderRadius: 4, textTransform: 'uppercase' }}>{text}</span>
+);
+
+function AhlScoringSummary({ sum }) {
+  const ahlLogo = useAhlLogo();
+  const goals = sum?.goals ?? [];
+  if (goals.length === 0) return <p style={S.empty}>No scoring yet.</p>;
+  // Running score after each goal.
+  const scored = goals.reduce((acc, g) => {
+    const prev = acc[acc.length - 1] ?? { awayScore: 0, homeScore: 0 };
+    const isHome = Number(g.home) === 1;
+    return [...acc, { ...g, awayScore: prev.awayScore + (isHome ? 0 : 1), homeScore: prev.homeScore + (isHome ? 1 : 0) }];
+  }, []);
+  const pids = [...new Set(scored.map(g => g.period_id))];
+  return (
+    <div>
+      {pids.map(pid => (
+        <div key={pid} style={{ marginBottom: 12 }}>
+          <div style={periodHeading}>{ahlPeriodName(sum, pid)}</div>
+          {scored.filter(g => g.period_id === pid).map((g, gi) => {
+            const assists = [g.assist1_player, g.assist2_player].filter(a => a?.player_id);
+            return (
+              <div key={gi} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderBottom: `1px solid ${LINE}` }}>
+                <Headshot src={ahlHeadshot(g.goal_scorer?.player_id)} size={36} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>
+                    <PlayerName id={g.goal_scorer?.player_id}>{ahlName(g.goal_scorer)}</PlayerName>
+                    {g.scorer_goal_num && <span style={{ fontWeight: 400, color: 'var(--text3)' }}> ({g.scorer_goal_num})</span>}
+                    {g.power_play === '1' && flagChip('pp')}
+                    {g.short_handed === '1' && flagChip('sh')}
+                    {g.penalty_shot === '1' && flagChip('ps')}
+                    {g.empty_net === '1' && flagChip('EN', 'var(--surface2)', 'var(--text2)')}
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text3)' }}>
+                    {assists.length
+                      ? assists.map((a, ai) => <span key={a.player_id}>{ai > 0 && ', '}<PlayerName id={a.player_id}>{ahlName(a)}</PlayerName></span>)
+                      : 'Unassisted'}
+                  </div>
+                </div>
+                <div style={{ textAlign: 'right', flexShrink: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 5, justifyContent: 'flex-end' }}>
+                    <img src={ahlLogo(g.team_id)} style={{ width: 16, height: 16, objectFit: 'contain' }} alt="" />
+                    <span style={{ fontFamily: MONO, fontWeight: 800, fontSize: 12, color: 'var(--text)' }}>{g.awayScore}–{g.homeScore}</span>
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--text4)', fontFamily: MONO }}>{g.time}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AhlPenaltySummary({ sum }) {
+  const ahlLogo = useAhlLogo();
+  const pens = sum?.penalties ?? [];
+  if (pens.length === 0) return <p style={S.empty}>No penalties.</p>;
+  const pids = [...new Set(pens.map(p => p.period_id))];
+  return (
+    <div>
+      {pids.map(pid => (
+        <div key={pid} style={{ marginBottom: 12 }}>
+          <div style={periodHeading}>{ahlPeriodName(sum, pid)}</div>
+          {pens.filter(p => p.period_id === pid).map((pen, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 0', borderBottom: `1px solid ${LINE}`, fontSize: 12 }}>
+              <span style={{ fontFamily: MONO, color: 'var(--text4)', width: 40, flexShrink: 0 }}>{pen.time_off_formatted}</span>
+              <img src={ahlLogo(pen.team_id)} style={{ width: 16, height: 16, flexShrink: 0, objectFit: 'contain' }} alt="" />
+              <span style={{ flex: 1, minWidth: 0, color: 'var(--text)' }}>
+                <strong>{pen.bench === '1' || !pen.player_penalized_info?.player_id ? 'Bench' : ahlName(pen.player_penalized_info)}</strong>
+                <span style={{ color: 'var(--text3)' }}> — {pen.lang_penalty_description}</span>
+              </span>
+              <span style={{ fontFamily: MONO, color: 'var(--text2)', flexShrink: 0 }}>{pen.minutes} min</span>
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AhlSkaterTable({ title, players }) {
+  if (!players?.length) return null;
+  const cols = [['G', p => p.goals], ['A', p => p.assists], ['P', p => Number(p.goals) + Number(p.assists)], ['+/-', p => fmtPlus(Number(p.plusminus))], ['SOG', p => p.shots], ['PIM', p => p.pim]];
+  return (
+    <div style={{ overflowX: 'auto', marginBottom: 10 }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+        <thead>
+          <tr style={{ background: 'var(--surface2)' }}>
+            <th style={{ ...S.th, textAlign: 'left' }}>{title}</th>
+            {cols.map(([l]) => <th key={l} style={S.th}>{l}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {players.map(p => (
+            <tr key={p.player_id} style={{ borderTop: `1px solid ${LINE}` }}>
+              <td style={{ ...S.td, textAlign: 'left', fontFamily: 'inherit', color: 'var(--text)', fontWeight: 600 }}>
+                <span style={{ color: 'var(--text4)', fontFamily: MONO, marginRight: 6 }}>{p.jersey_number}</span>
+                <PlayerName id={p.player_id}>{ahlName(p)}</PlayerName>
+                <span style={{ color: 'var(--text4)', fontSize: 10 }}> {p.position_str}</span>
+              </td>
+              {cols.map(([l, fn]) => {
+                const hot = (l === 'G' || l === 'P') && Number(fn(p)) > 0;
+                return <td key={l} style={{ ...S.td, fontWeight: hot ? 800 : 400, color: l === 'G' && hot ? ACCENT : S.td.color }}>{fn(p) ?? '—'}</td>;
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AhlGoalieTable({ goalies }) {
+  if (!goalies?.length) return null;
+  const decision = (g) => (g.win === '1' ? 'W' : g.loss === '1' ? 'L' : g.ot_loss === '1' ? 'OTL' : g.shootout_loss === '1' ? 'SOL' : '');
+  return (
+    <div style={{ overflowX: 'auto', marginBottom: 10 }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+        <thead>
+          <tr style={{ background: 'var(--surface2)' }}>
+            <th style={{ ...S.th, textAlign: 'left' }}>Goalies</th>
+            {['SA', 'SV', 'GA', 'SV%', 'TOI', 'DEC'].map(l => <th key={l} style={S.th}>{l}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {goalies.map(g => {
+            const dec = decision(g);
+            return (
+              <tr key={g.player_id} style={{ borderTop: `1px solid ${LINE}` }}>
+                <td style={{ ...S.td, textAlign: 'left', fontFamily: 'inherit', color: 'var(--text)', fontWeight: 600 }}><PlayerName id={g.player_id}>{ahlName(g)}</PlayerName></td>
+                <td style={S.td}>{g.shots_against}</td>
+                <td style={S.td}>{g.saves}</td>
+                <td style={S.td}>{g.goals_against}</td>
+                <td style={{ ...S.td, fontWeight: 700, color: 'var(--text)' }}>{Number(g.shots_against) > 0 ? fmtPct(Number(g.saves) / Number(g.shots_against)) : '—'}</td>
+                <td style={S.td}>{g.secs_mmss}</td>
+                <td style={{ ...S.td, fontWeight: 800, color: dec === 'W' ? '#15803d' : dec ? LIVE : S.td.color }}>{dec}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AhlPlayerBoxScore({ sum }) {
+  const ahlLogo = useAhlLogo();
+  const sides = [['visitor', sum?.visitor_team_lineup], ['home', sum?.home_team_lineup]];
+  if (!sides.some(([, l]) => l?.players?.length)) return <p style={S.empty}>Player stats will appear once the game starts.</p>;
+  return (
+    <div>
+      {sides.map(([side, lineup]) => {
+        const skaters = (lineup?.players ?? []).filter(p => p.position_str !== 'G');
+        return (
+          <div key={side} style={{ marginBottom: 18 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 14, fontWeight: 800, color: 'var(--text)', marginBottom: 6 }}>
+              <img src={ahlLogo(sum[side]?.id)} style={{ width: 22, height: 22, objectFit: 'contain' }} alt="" />
+              {sum[side]?.name}
+            </div>
+            <AhlSkaterTable title="Forwards" players={skaters.filter(p => p.position_str !== 'D')} />
+            <AhlSkaterTable title="Defense" players={skaters.filter(p => p.position_str === 'D')} />
+            <AhlGoalieTable goalies={sum.goalies?.[side]} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function AhlGameInfoPanel({ game, sum, teamMap }) {
+  const row = (label, value) => value ? (
+    <div style={{ display: 'flex', gap: 12, padding: '7px 0', borderBottom: `1px solid ${LINE}`, fontSize: 12 }}>
+      <span style={{ width: 110, flexShrink: 0, color: 'var(--text3)', fontWeight: 700, textTransform: 'uppercase', fontSize: 10, letterSpacing: '0.05em', paddingTop: 1 }}>{label}</span>
+      <span style={{ color: 'var(--text)', flex: 1 }}>{value}</span>
+    </div>
+  ) : null;
+  const away = teamMap[game.away.id];
+  const home = teamMap[game.home.id];
+  const pp = (side) => `${sum.powerPlayGoals?.[side] ?? 0} of ${sum.powerPlayCount?.[side] ?? 0}`;
+  return (
+    <div>
+      {row('Date', sum?.game_date ?? longDate(game.date))}
+      {row('Status', game.statusText)}
+      {row('Arena', sum?.venue ?? game.venue)}
+      {Number(sum?.meta?.attendance) > 0 && row('Attendance', Number(sum.meta.attendance).toLocaleString('en-US'))}
+      {away && home && row('Records', `${game.away.code} ${ahlRecord(away)} (${away.points} pts) · ${game.home.code} ${ahlRecord(home)} (${home.points} pts)`)}
+      {game.started && sum?.powerPlayCount && row('Power play', `${game.away.code} ${pp('visitor')} · ${game.home.code} ${pp('home')}`)}
+      {row('Referees', [sum?.referee1, sum?.referee2].filter(Boolean).join(', '))}
+      {row('Linesmen', [sum?.linesman1, sum?.linesman2].filter(Boolean).join(', '))}
+    </div>
+  );
+}
+
+function AhlGameModal({ game, teamMap, onClose }) {
+  const ahlLogo = useAhlLogo();
+  const [sum, setSum] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState(game.started ? 'summary' : 'info');
+
+  useEffect(() => {
+    const load = () => ahlFetch({ feed: 'gc', tab: 'gamesummary', game_id: game.id })
+      .then(d => setSum(d.GC?.Gamesummary ?? null)).catch(() => {}).finally(() => setLoaded(true));
+    load();
+    if (!game.live) return;
+    const id = setInterval(load, 20_000);
+    return () => clearInterval(id);
+  }, [game.id, game.live]);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const { away, home } = game;
+  const tabs = game.started
+    ? [['summary', 'Summary'], ['box', 'Box Score'], ['penalties', 'Penalties'], ['info', 'Game Info']]
+    : [['info', 'Preview']];
+  const side = (team) => (
+    <div style={{ textAlign: 'center', flex: 1, minWidth: 0 }}>
+      <img src={ahlLogo(team.id)} style={{ width: 56, height: 56, objectFit: 'contain' }} alt="" />
+      <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--text)' }}>{team.name ?? teamMap[team.id]?.name ?? team.code}</div>
+      <div style={{ fontSize: 11, color: 'var(--text4)' }}>{ahlRecord(teamMap[team.id])}</div>
+    </div>
+  );
+
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div className="fade-up" style={S.modal} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '14px 20px 12px', background: 'linear-gradient(180deg, var(--surface2), var(--surface))' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <StatusBadge live={game.live} final={game.final} text={game.statusText} />
+            <button style={S.modalClose} onClick={onClose} aria-label="Close"><X size={14} /></button>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 8 }}>
+            {side(away)}
+            <div style={{ fontSize: 34, fontWeight: 900, fontFamily: MONO, color: 'var(--text)', flexShrink: 0 }}>
+              {game.started ? `${sum?.totalGoals?.visitor ?? away.score}–${sum?.totalGoals?.home ?? home.score}` : <span style={{ fontSize: 16, color: 'var(--text3)' }}>@</span>}
+            </div>
+            {side(home)}
+          </div>
+          <div style={{ textAlign: 'center', fontSize: 11, color: 'var(--text4)', marginTop: 4 }}>{game.venue}</div>
+        </div>
+        <TabBar tabs={tabs} active={tab} onChange={setTab} />
+        <div style={{ padding: '16px 20px 20px' }}>
+          {!loaded && <p style={S.empty}>Loading game center...</p>}
+          {loaded && (
+            <>
+              {tab !== 'info' && <AhlLineScore sum={sum} />}
+              {tab === 'summary' && (
+                <>
+                  <AhlThreeStars sum={sum} />
+                  <AhlScoringSummary sum={sum} />
+                </>
+              )}
+              {tab === 'box' && <AhlPlayerBoxScore sum={sum} />}
+              {tab === 'penalties' && <AhlPenaltySummary sum={sum} />}
+              {tab === 'info' && <AhlGameInfoPanel game={game} sum={sum ?? {}} teamMap={teamMap} />}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── AHL player card ────────────────────────────────────────────────────────
+const AHL_SKATER_COLS = [['GP', 'games_played'], ['G', 'goals'], ['A', 'assists'], ['P', 'points'], ['+/-', 'plus_minus'], ['PIM', 'penalty_minutes']];
+const AHL_GOALIE_COLS = [['GP', 'games_played'], ['W', 'wins'], ['L', 'losses'], ['OTL', 'ot_losses'], ['SOL', 'shootout_losses'], ['GAA', 'gaa'], ['SV%', 'savepct'], ['SO', 'shutouts']];
+const fmtAhlStat = (key, v) => v == null || v === '' ? '—' : key === 'savepct' ? fmtPct(v) : key === 'gaa' ? fmtNum(v) : key === 'plus_minus' ? fmtPlus(Number(v)) : v;
+
+function AhlPlayerModal({ playerId, onClose }) {
+  const ahlLogo = useAhlLogo();
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    setData(null); setError(false);
+    Promise.all([
+      ahlKit('player', { category: 'profile', player_id: playerId }),
+      ahlKit('player', { category: 'seasonstats', player_id: playerId }),
+    ]).then(([prof, stats]) => {
+      if (!prof.Player?.name) throw new Error('not found');
+      setData({ p: prof.Player, stats: stats.Player ?? {} });
+    }).catch(() => setError(true));
+  }, [playerId]);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const p = data?.p;
+  const isGoalie = p?.position === 'G';
+  const cols = isGoalie ? AHL_GOALIE_COLS : AHL_SKATER_COLS;
+  const regular = data?.stats?.regular ?? [];
+  const seasons = regular.filter(s => s.season_name !== 'Total');
+  const career = regular.find(s => s.season_name === 'Total');
+  const latest = seasons[0];
+  const tableCols = isGoalie ? AHL_GOALIE_COLS : [...AHL_SKATER_COLS, ['PPG', 'power_play_goals'], ['S', 'shots']];
+  const draft = p?.draft?.[0];
+
+  return (
+    <div style={{ ...S.overlay, zIndex: 120 }} onClick={onClose}>
+      <div className="fade-up" style={{ ...S.modal, maxWidth: 720 }} onClick={e => e.stopPropagation()}>
+        {error && <p style={S.empty}>Couldn't load this player.</p>}
+        {!p && !error && <p style={S.empty}>Loading player...</p>}
+        {p && (
+          <>
+            <div style={{ position: 'relative', background: `linear-gradient(120deg, #111827, ${BRAND})`, color: '#fff', padding: '20px 20px 16px' }}>
+              <button style={{ ...S.modalClose, position: 'absolute', top: 12, right: 12, zIndex: 2 }} onClick={onClose} aria-label="Close"><X size={14} /></button>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+                <Headshot src={p.primary_image || ahlHeadshot(playerId)} size={96} style={{ border: '3px solid #fff' }} />
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, opacity: 0.8, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    {p.most_recent_team_id && <img src={ahlLogo(p.most_recent_team_id)} style={{ width: 20, height: 20, background: '#fff', borderRadius: 4, padding: 1, objectFit: 'contain' }} alt="" />}
+                    {p.most_recent_team_name || 'AHL'} · #{p.jersey_number || '—'} · {p.position}
+                  </div>
+                  <div style={{ fontSize: 26, fontWeight: 900, lineHeight: 1.1 }}>{p.name}</div>
+                  <div style={{ fontSize: 12, opacity: 0.85, marginTop: 4 }}>
+                    {ahlHeight(p.height)} · {p.weight} lb · {isGoalie ? 'Catches' : 'Shoots'} {isGoalie ? p.catches : p.shoots}
+                    {p.birthdate && <> · Born {new Date(`${p.birthdate}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}{p.birthtown ? `, ${p.birthtown}` : ''}</>}
+                  </div>
+                  {draft?.draft_text && <div style={{ fontSize: 11, opacity: 0.7, marginTop: 2 }}>{draft.draft_league} Draft: {draft.draft_text.trim()}</div>}
+                </div>
+              </div>
+            </div>
+            <div style={{ padding: '16px 20px 20px', maxHeight: '65vh', overflowY: 'auto' }}>
+              {latest && (
+                <>
+                  <div style={{ ...S.cardLabel, margin: '0 -20px 10px', padding: '6px 20px' }}>{latest.season_name}{latest.team_code ? ` · ${latest.team_code}` : ''}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(70px, 1fr))', gap: 6, marginBottom: 14 }}>
+                    {cols.map(([l, k]) => <StatTile key={l} label={l} value={fmtAhlStat(k, latest[k])} />)}
+                  </div>
+                </>
+              )}
+              {career && (
+                <>
+                  <div style={{ ...S.cardLabel, margin: '0 -20px 10px', padding: '6px 20px' }}>AHL Career</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(70px, 1fr))', gap: 6, marginBottom: 14 }}>
+                    {cols.map(([l, k]) => <StatTile key={l} label={l} value={fmtAhlStat(k, career[k])} />)}
+                  </div>
+                </>
+              )}
+              {seasons.length > 0 && (
+                <>
+                  <div style={{ ...S.cardLabel, margin: '0 -20px 8px', padding: '6px 20px' }}>Season by Season</div>
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+                      <thead><tr>
+                        <th style={{ ...S.th, textAlign: 'left' }}>Season</th><th style={{ ...S.th, textAlign: 'left' }}>Team</th>
+                        {tableCols.map(([l]) => <th key={l} style={S.th}>{l}</th>)}
+                      </tr></thead>
+                      <tbody>
+                        {seasons.map((s, i) => (
+                          <tr key={i} style={{ borderTop: `1px solid ${LINE}` }}>
+                            <td style={{ ...S.td, textAlign: 'left' }}>{s.shortname}</td>
+                            <td style={{ ...S.td, textAlign: 'left', fontFamily: 'inherit' }}>{s.team_name}</td>
+                            {tableCols.map(([l, k]) => <td key={l} style={S.td}>{fmtAhlStat(k, s[k])}</td>)}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+              {!latest && <p style={S.empty}>No AHL regular-season stats yet.</p>}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── AHL standings ──────────────────────────────────────────────────────────
+const AHL_CLINCH_LABELS = { x: 'Clinched playoff berth', y: 'Clinched division', z: 'Clinched conference', e: 'Eliminated' };
+
+function AhlStandingsTable({ title, rows, onTeamClick, accent = ACCENT }) {
+  const ahlLogo = useAhlLogo();
+  const cols = [
+    ['GP', t => t.games_played], ['W', t => t.wins], ['L', t => t.losses], ['OTL', t => t.ot_losses], ['SOL', t => t.shootout_losses],
+    ['PTS', t => t.points, true], ['PCT', t => fmtPct(t.percentage)], ['RW', t => t.regulation_wins],
+    ['GF', t => t.goals_for], ['GA', t => t.goals_against], ['DIFF', t => fmtPlus(Number(t.goals_diff))],
+    ['HOME', t => t.home_record], ['AWAY', t => t.visiting_record], ['L10', t => t.past_10], ['STRK', t => t.streak_wl || '—'],
+    ['PP%', t => t.power_play_pct], ['PK%', t => t.penalty_kill_pct],
+  ];
+  return (
+    <div style={{ ...S.card, marginBottom: 14 }}>
+      <div style={{ padding: '8px 14px', fontSize: 12, fontWeight: 800, color: '#fff', background: accent, letterSpacing: '0.04em' }}>{title}</div>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+          <thead>
+            <tr style={{ background: 'var(--surface2)' }}>
+              <th style={{ ...S.th, width: 24 }}>#</th>
+              <th style={{ ...S.th, textAlign: 'left' }}>Team</th>
+              {cols.map(([l]) => <th key={l} style={S.th}>{l}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((t, i) => (
+              <tr key={t.team_id} onClick={() => onTeamClick?.(t.team_id)} {...rowHover}
+                style={{ cursor: onTeamClick ? 'pointer' : 'default', borderTop: `1px solid ${LINE}` }}>
+                <td style={{ ...S.td, color: 'var(--text4)' }}>{i + 1}</td>
+                <td style={{ ...S.td, textAlign: 'left', fontFamily: 'inherit', fontWeight: 700, color: 'var(--text)' }}>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                    <img src={ahlLogo(t.team_id)} style={{ width: 22, height: 22, objectFit: 'contain' }} alt="" />
+                    {t.team_name}
+                    {t.clinched && <span title={AHL_CLINCH_LABELS[t.clinched]} style={{ fontSize: 10, fontWeight: 800, color: t.clinched === 'e' ? LIVE : '#15803d' }}>{t.clinched}</span>}
+                  </span>
+                </td>
+                {cols.map(([l, fn, bold]) => <td key={l} style={{ ...S.td, fontWeight: bold ? 900 : 400, color: bold ? 'var(--text)' : S.td.color }}>{fn(t)}</td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// The AHL ranks teams by points percentage (teams play different numbers of games).
+const byAhlPct = (a, b) => Number(b.percentage_full) - Number(a.percentage_full) || Number(b.points) - Number(a.points);
+
+function AhlStandingsPage({ standings, seasonPicker, onTeamClick }) {
+  const [view, setView] = useState('division');
+  const rows = standings;
+  const conferences = [...new Set((rows ?? []).map(t => t.conference_name))];
+  const divisions = [...new Set((rows ?? []).map(t => t.division_name))];
+  const confAccent = (conf) => (conferences.indexOf(conf) === 0 ? ACCENT : BRAND);
+  const btn = (id, label) => (
+    <button onClick={() => setView(id)} style={{ ...S.btnGray, background: view === id ? ACCENT : 'var(--surface)', color: view === id ? '#fff' : INK, borderColor: view === id ? ACCENT : undefined }}>{label}</button>
+  );
+  return (
+    <div>
+      <div style={S.bodyHeader}>
+        <h2 style={S.sectionTitle}>AHL Standings</h2>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          {btn('division', 'Division')}
+          {btn('conference', 'Conference')}
+          {btn('league', 'League')}
+          {seasonPicker}
+        </div>
+      </div>
+      {!rows && <p style={S.empty}>Loading standings...</p>}
+      {rows && rows.length === 0 && <p style={S.empty}>No standings available.</p>}
+      {rows && rows.length > 0 && (
+        <>
+          {view === 'division' && divisions.map(div => {
+            const teams = rows.filter(t => t.division_name === div);
+            return <AhlStandingsTable key={div} title={div} rows={teams} onTeamClick={onTeamClick} accent={confAccent(teams[0]?.conference_name)} />;
+          })}
+          {view === 'conference' && conferences.map(conf => (
+            <AhlStandingsTable key={conf} title={conf} onTeamClick={onTeamClick} accent={confAccent(conf)}
+              rows={rows.filter(t => t.conference_name === conf).sort(byAhlPct)} />
+          ))}
+          {view === 'league' && (
+            <AhlStandingsTable title="American Hockey League" onTeamClick={onTeamClick} accent={BRAND} rows={[...rows].sort(byAhlPct)} />
+          )}
+          <p style={{ fontSize: 11, color: 'var(--text4)' }}>
+            Record is W-L-OTL-SOL. Teams are ranked by points percentage. {Object.entries(AHL_CLINCH_LABELS).map(([k, v]) => `${k} — ${v}`).join(' · ')}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── AHL teams ──────────────────────────────────────────────────────────────
+function AhlTeamsGrid({ standings, onSelect }) {
+  const ahlLogo = useAhlLogo();
+  if (!standings) return <p style={S.empty}>Loading teams...</p>;
+  if (standings.length === 0) return <p style={S.empty}>No teams found for this season.</p>;
+  const conferences = [...new Set(standings.map(t => t.conference_name))];
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 22 }}>
+      {conferences.map(conf => (
+        <div key={conf}>
+          <div style={{ fontSize: 13, fontWeight: 800, color: INK, marginBottom: 10, paddingBottom: 6, borderBottom: `2px solid ${AHL_RED}` }}>{conf}</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))', gap: 14 }}>
+            {[...new Set(standings.filter(t => t.conference_name === conf).map(t => t.division_name))].map(div => (
+              <div key={div} style={S.card}>
+                <div style={S.cardLabel}>{div}</div>
+                {standings.filter(t => t.division_name === div).map((t, i, arr) => (
+                  <div key={t.team_id} onClick={() => onSelect(t.team_id)} {...rowHover}
+                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 14px', borderBottom: i < arr.length - 1 ? `1px solid ${LINE}` : 'none', cursor: 'pointer' }}>
+                    <span style={{ fontSize: 10, color: 'var(--text4)', fontWeight: 700, width: 14 }}>{i + 1}</span>
+                    <img src={ahlLogo(t.team_id)} style={{ width: 32, height: 32, objectFit: 'contain' }} alt="" />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: INK }}>{t.team_name}</div>
+                      <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: MONO }}>{ahlRecord(t)} · {t.points} pts</div>
+                    </div>
+                    <ChevronRight size={14} color="var(--text4)" />
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AhlTeamDetail({ teamId, teamMap, seasonId, seasonPicker, onBack, onGameClick }) {
+  const ahlLogo = useAhlLogo();
+  const [tab, setTab] = useState('stats');
+  const [skaters, setSkaters] = useState(null);
+  const [goalies, setGoalies] = useState(null);
+  const [roster, setRoster] = useState(null);
+  const [schedule, setSchedule] = useState(null);
+  const info = teamMap[teamId];
+
+  useEffect(() => {
+    if (!seasonId) return;
+    setSkaters(null); setGoalies(null); setRoster(null); setSchedule(null);
+    const common = { season_id: seasonId, team_id: teamId, first: 0, limit: 200, context: 'overall' };
+    ahlKit('statviewtype', { ...common, type: 'topscorers', sort: 'points', stat: 'all', qualified: 'all' }).then(d => setSkaters((d.Statviewtype ?? []).filter(p => p.position !== 'G'))).catch(() => setSkaters([]));
+    ahlKit('statviewtype', { ...common, type: 'topgoalies', sort: 'gaa', qualified: 'all' }).then(d => setGoalies(d.Statviewtype ?? [])).catch(() => setGoalies([]));
+    ahlKit('roster', { team_id: teamId, season_id: seasonId }).then(d => setRoster((d.Roster ?? []).filter(p => p?.position))).catch(() => setRoster([]));
+    ahlKit('schedule', { team_id: teamId, season_id: seasonId }).then(d => setSchedule((d.Schedule ?? []).map(normAhlGame))).catch(() => setSchedule([]));
+  }, [teamId, seasonId]);
+
+  const games = schedule ?? [];
+  const nameFromSchedule = games[0] && (games[0].home.id === teamId ? games[0].home.name : games[0].away.name);
+  const rosterGroups = [
+    ['Forwards', (roster ?? []).filter(p => !['D', 'G'].includes(p.position))],
+    ['Defense', (roster ?? []).filter(p => p.position === 'D')],
+    ['Goalies', (roster ?? []).filter(p => p.position === 'G')],
+  ];
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+        <button style={S.btnGray} onClick={onBack}><ArrowLeft size={13} /> All teams</button>
+        {seasonPicker}
+      </div>
+      <div style={{ ...S.card, marginBottom: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16, padding: '16px 20px', flexWrap: 'wrap', background: 'linear-gradient(90deg, var(--surface2), var(--surface))' }}>
+          <img src={ahlLogo(teamId)} style={{ width: 80, height: 80, objectFit: 'contain' }} alt="" />
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <div style={{ fontSize: 24, fontWeight: 900, color: INK }}>{info?.name ?? nameFromSchedule ?? 'AHL Team'}</div>
+            {info && <div style={{ fontSize: 12, color: 'var(--text3)' }}>{info.division} · {info.conference}</div>}
+          </div>
+          {info && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(64px, 1fr))', gap: 6 }}>
+              <StatTile label="Record" value={ahlRecord(info)} />
+              <StatTile label="Points" value={info.points} />
+              <StatTile label="Div Rank" value={ordinal(info.divisionRank)} />
+              <StatTile label="Diff" value={fmtPlus(info.goalDiff)} />
+            </div>
+          )}
+        </div>
+        <TabBar tabs={[['stats', <><BarChart3 size={13} /> Player Stats</>], ['roster', <><Users size={13} /> Roster</>], ['schedule', <><Calendar size={13} /> Schedule</>]]} active={tab} onChange={setTab} />
+        <div style={{ padding: '12px 16px 16px' }}>
+          {tab === 'stats' && (!skaters || !goalies ? <p style={S.empty}>Loading stats...</p> : (
+            <>
+              {skaters.length === 0 && <p style={S.empty}>No stats yet this season.</p>}
+              {skaters.length > 0 && (
+                <div style={{ overflowX: 'auto', marginBottom: 14 }}>
+                  <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+                    <thead><tr style={{ background: 'var(--surface2)' }}>
+                      <th style={{ ...S.th, textAlign: 'left' }}>Skater</th>
+                      {['Pos', 'GP', 'G', 'A', 'P', '+/-', 'PIM', 'PPG', 'SHG', 'S', 'S%'].map(l => <th key={l} style={S.th}>{l}</th>)}
+                    </tr></thead>
+                    <tbody>
+                      {skaters.map(s => (
+                        <tr key={s.player_id} style={{ borderTop: `1px solid ${LINE}` }}>
+                          <td style={{ ...S.td, textAlign: 'left', fontFamily: 'inherit', fontWeight: 600, color: INK }}>
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                              <Headshot src={ahlHeadshot(s.player_id)} size={24} />
+                              <PlayerName id={s.player_id}>{s.name}</PlayerName>
+                              {s.rookie === '1' && <span style={{ fontSize: 9, fontWeight: 800, color: PUCK_ORANGE }}>R</span>}
+                            </span>
+                          </td>
+                          <td style={S.td}>{s.position}</td>
+                          <td style={S.td}>{s.games_played}</td>
+                          <td style={S.td}>{s.goals}</td>
+                          <td style={S.td}>{s.assists}</td>
+                          <td style={{ ...S.td, fontWeight: 900, color: INK }}>{s.points}</td>
+                          <td style={S.td}>{fmtPlus(Number(s.plus_minus))}</td>
+                          <td style={S.td}>{s.penalty_minutes}</td>
+                          <td style={S.td}>{s.power_play_goals}</td>
+                          <td style={S.td}>{s.short_handed_goals}</td>
+                          <td style={S.td}>{s.shots}</td>
+                          <td style={S.td}>{Number(s.shots) ? s.shooting_percentage : '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {goalies.length > 0 && (
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+                    <thead><tr style={{ background: 'var(--surface2)' }}>
+                      <th style={{ ...S.th, textAlign: 'left' }}>Goalie</th>
+                      {['GP', 'W', 'L', 'OTL', 'SOL', 'GAA', 'SV%', 'SA', 'SV', 'SO'].map(l => <th key={l} style={S.th}>{l}</th>)}
+                    </tr></thead>
+                    <tbody>
+                      {[...goalies].sort((a, b) => Number(b.games_played) - Number(a.games_played)).map(g => (
+                        <tr key={g.player_id} style={{ borderTop: `1px solid ${LINE}` }}>
+                          <td style={{ ...S.td, textAlign: 'left', fontFamily: 'inherit', fontWeight: 600, color: INK }}>
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                              <Headshot src={ahlHeadshot(g.player_id)} size={24} />
+                              <PlayerName id={g.player_id}>{g.name}</PlayerName>
+                            </span>
+                          </td>
+                          <td style={S.td}>{g.games_played}</td>
+                          <td style={{ ...S.td, fontWeight: 800, color: INK }}>{g.wins}</td>
+                          <td style={S.td}>{g.losses}</td>
+                          <td style={S.td}>{g.ot_losses}</td>
+                          <td style={S.td}>{g.shootout_losses}</td>
+                          <td style={S.td}>{fmtNum(g.goals_against_average)}</td>
+                          <td style={S.td}>{fmtPct(g.save_percentage)}</td>
+                          <td style={S.td}>{g.shots}</td>
+                          <td style={S.td}>{g.saves}</td>
+                          <td style={S.td}>{g.shutouts}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          ))}
+          {tab === 'roster' && (!roster ? <p style={S.empty}>Loading roster...</p> : roster.length === 0 ? <p style={S.empty}>No roster listed for this season.</p> : (
+            rosterGroups.map(([label, list]) => list.length > 0 && (
+              <div key={label} style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 11, fontWeight: 800, color: 'var(--text3)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>{label}</div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', gap: 8 }}>
+                  {list.map(pl => (
+                    <PlayerName key={pl.player_id} id={pl.player_id} style={{ textDecoration: 'none' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 8, border: `1px solid ${LINE}`, borderRadius: RADIUS.md, background: 'var(--surface)' }} {...rowHover}>
+                        <Headshot src={pl.player_image || ahlHeadshot(pl.player_id)} size={42} />
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 13, fontWeight: 700, color: INK, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            <span style={{ color: ACCENT, fontFamily: MONO, marginRight: 5 }}>#{pl.tp_jersey_number || '—'}</span>
+                            {pl.name}
+                          </div>
+                          <div style={{ fontSize: 11, color: 'var(--text3)' }}>
+                            {pl.position} · {ahlHeight(pl.height)} · {pl.weight} lb · {pl.shoots}{pl.birthplace ? ` · ${pl.birthplace.replace(/,\s*$/, '')}` : ''}
+                          </div>
+                        </div>
+                      </div>
+                    </PlayerName>
+                  ))}
+                </div>
+              </div>
+            ))
+          ))}
+          {tab === 'schedule' && (!schedule ? <p style={S.empty}>Loading schedule...</p> : (
+            <div style={{ display: 'flex', flexDirection: 'column' }}>
+              {games.length === 0 && <p style={S.empty}>No schedule found.</p>}
+              {games.map(g => {
+                const home = g.home.id === teamId;
+                const opp = home ? g.away : g.home;
+                const us = home ? g.home : g.away;
+                const won = g.final && us.score > opp.score;
+                return (
+                  <div key={g.id} onClick={() => onGameClick(g)} {...rowHover}
+                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 6px', borderBottom: `1px solid ${LINE}`, cursor: 'pointer', fontSize: 12 }}>
+                    <span style={{ width: 90, color: 'var(--text3)', flexShrink: 0 }}>{new Date(`${g.date}T12:00:00`).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}</span>
+                    <span style={{ color: 'var(--text4)', width: 18 }}>{home ? 'vs' : '@'}</span>
+                    <img src={ahlLogo(opp.id)} style={{ width: 20, height: 20, objectFit: 'contain' }} alt="" />
+                    <span style={{ fontWeight: 700, color: INK, flex: 1 }}>{opp.name ?? teamMap[opp.id]?.name ?? opp.code}</span>
+                    {g.final
+                      ? <span style={{ fontFamily: MONO, fontWeight: 800, color: won ? '#15803d' : LIVE }}>{won ? 'W' : 'L'} {us.score}–{opp.score}{/OT|SO/.test(g.statusText ?? '') ? ` ${g.statusText.match(/\d*OT|SO/)[0]}` : ''}</span>
+                      : <span style={{ color: 'var(--text3)', fontFamily: MONO }}>{g.statusText}</span>}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── AHL leaders ────────────────────────────────────────────────────────────
+// [cat, label, feed type, sort param, value field, extra params]. The cat ids
+// reuse the NHL names so fmtLeader/LeaderCard format them the same way.
+const AHL_SKATER_LEADER_CATS = [
+  ['points', 'Points', 'topscorers', 'points', 'points'],
+  ['goals', 'Goals', 'topscorers', 'goals', 'goals'],
+  ['assists', 'Assists', 'topscorers', 'assists', 'assists'],
+  ['rookiePoints', 'Rookie Points', 'topscorers', 'points', 'points', { stat: 'rookies' }],
+  ['plusMinus', 'Plus/Minus', 'topscorers', 'plus_minus', 'plus_minus'],
+  ['goalsPp', 'Power-Play Goals', 'topscorers', 'power_play_goals', 'power_play_goals'],
+  ['penaltyMins', 'Penalty Minutes', 'topscorers', 'penalty_minutes', 'penalty_minutes'],
+];
+const AHL_GOALIE_LEADER_CATS = [
+  ['wins', 'Wins', 'topgoalies', 'wins', 'wins'],
+  ['savePctg', 'Save %', 'topgoalies', 'save_percentage', 'save_percentage'],
+  ['goalsAgainstAverage', 'Goals Against Avg', 'topgoalies', 'gaa', 'goals_against_average'],
+  ['shutouts', 'Shutouts', 'topgoalies', 'shutouts', 'shutouts'],
+];
+const AHL_ALL_LEADER_CATS = [...AHL_SKATER_LEADER_CATS, ...AHL_GOALIE_LEADER_CATS];
+const AHL_HOME_LEADER_CATS = AHL_ALL_LEADER_CATS.filter(c => ['points', 'goals', 'assists', 'wins', 'savePctg', 'goalsAgainstAverage'].includes(c[0]));
+
+// Returns { [cat]: rows } in LeaderCard's shape; a cat is missing until it loads.
+function useAhlLeaders(seasonId, limit, cats) {
+  const [data, setData] = useState({});
+  useEffect(() => {
+    if (!seasonId) return;
+    let cancelled = false;
+    setData({});
+    cats.forEach(([cat, , type, sort, key, extra]) => {
+      const qualify = type === 'topscorers' ? { stat: 'all', qualified: 'all' } : { qualified: 'qualified' };
+      ahlKit('statviewtype', { type, season_id: seasonId, first: 0, limit, sort, context: 'overall', ...qualify, ...extra })
+        .then(d => (d.Statviewtype ?? []).map(r => ({
+          id: r.player_id, headshot: ahlHeadshot(r.player_id), firstName: r.first_name, lastName: r.last_name,
+          teamId: r.team_id, teamName: r.team_name, sweaterNumber: r.jersey_number, position: r.position ?? 'G',
+          value: Number(r[key]),
+        })))
+        .catch(() => [])
+        .then(rows => { if (!cancelled) setData(prev => ({ ...prev, [cat]: rows })); });
+    });
+    return () => { cancelled = true; };
+  }, [seasonId, limit, cats]);
+  const ahlLogo = useAhlLogo();
+  return Object.fromEntries(Object.entries(data).map(([cat, rows]) => [cat, rows.map(r => ({ ...r, teamLogo: ahlLogo(r.teamId) }))]));
+}
+
+function AhlLeadersPage({ seasonId, seasonPicker }) {
+  const leaders = useAhlLeaders(seasonId, 10, AHL_ALL_LEADER_CATS);
+  const grid = { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 300px), 1fr))', gap: 14, marginBottom: 22 };
+  return (
+    <div>
+      <div style={S.bodyHeader}><h2 style={S.sectionTitle}>AHL Leaders</h2>{seasonPicker}</div>
+      <h3 style={{ fontSize: 14, fontWeight: 800, color: 'var(--text2)', margin: '0 0 10px' }}>Skaters</h3>
+      <div style={grid}>
+        {AHL_SKATER_LEADER_CATS.map(([cat, label]) => <LeaderCard key={cat} cat={cat} label={label} leaders={leaders[cat]} />)}
+      </div>
+      <h3 style={{ fontSize: 14, fontWeight: 800, color: 'var(--text2)', margin: '0 0 10px' }}>Goaltenders <span style={{ fontWeight: 500, fontSize: 11, color: 'var(--text4)' }}>(qualified)</span></h3>
+      <div style={grid}>
+        {AHL_GOALIE_LEADER_CATS.map(([cat, label]) => <LeaderCard key={cat} cat={cat} label={label} leaders={leaders[cat]} />)}
+      </div>
+    </div>
+  );
+}
+
+// ─── AHL home ───────────────────────────────────────────────────────────────
+function AhlHomePage({ standings, games, dateStr, seasonId, onGameClick, onTeamClick }) {
+  const ahlLogo = useAhlLogo();
+  const todayQuote = useMemo(() => quoteOfTheDay(), []);
+  const leaders = useAhlLeaders(seasonId, 1, AHL_HOME_LEADER_CATS);
+  const featured = AHL_HOME_LEADER_CATS.map(([cat, label]) => ({ cat, label, p: leaders[cat]?.[0] })).filter(f => f.p);
+  const isToday = dateStr === localDateStr();
+  const conferences = [...new Set((standings ?? []).map(t => t.conference_name))];
+  const th = { ...S.th, padding: '3px 5px' };
+  const td = { ...S.td, padding: '3px 5px' };
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))', gap: 20, alignItems: 'start' }}>
+      <div>
+        <div style={{ ...S.card, marginBottom: 20 }}>
+          <div style={S.cardLabel}><Calendar size={13} /> {isToday ? "Today's AHL Games" : `AHL Games · ${longDate(dateStr)}`}</div>
+          {!games && <p style={S.empty}>Loading games...</p>}
+          {games?.length === 0 && <p style={S.empty}>No games scheduled.</p>}
+          {(games ?? []).map(g => (
+            <div key={g.id} onClick={() => onGameClick(g)} {...rowHover}
+              style={{ padding: '9px 16px', borderBottom: `1px solid ${LINE}`, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, cursor: 'pointer' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0, fontSize: 12 }}>
+                {[g.away, g.home].map((t, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <img src={ahlLogo(t.id)} style={{ width: 20, height: 20, objectFit: 'contain' }} alt="" />
+                    <span style={{ fontWeight: 700, color: 'var(--text)', width: 170, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.name ?? t.code}</span>
+                    {g.started && <span style={{ fontFamily: MONO, fontWeight: 900, color: 'var(--text)' }}>{t.score}</span>}
+                  </div>
+                ))}
+              </div>
+              <StatusBadge live={g.live} final={g.final} text={g.statusText} />
+            </div>
+          ))}
+        </div>
+        <div style={S.card}>
+          <div style={S.cardLabel}><Star size={13} /> AHL Leaders</div>
+          {featured.length === 0 && <p style={S.empty}>{Object.keys(leaders).length < AHL_HOME_LEADER_CATS.length ? 'Loading...' : 'No stats yet this season.'}</p>}
+          {featured.map((f, i) => (
+            <PlayerName key={f.cat} id={f.p.id} style={{ display: 'block' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 16px', borderBottom: i === featured.length - 1 ? 'none' : `1px solid ${LINE}` }} {...rowHover}>
+                <Headshot src={f.p.headshot} size={48} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>{f.p.firstName} {f.p.lastName}</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text3)' }}>
+                    <img src={f.p.teamLogo} style={{ width: 15, height: 15, objectFit: 'contain' }} alt="" />{f.p.teamName}
+                  </div>
+                </div>
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ fontSize: 17, fontWeight: 900, fontFamily: MONO, color: ACCENT }}>{fmtLeader(f.cat, f.p.value)}</div>
+                  <div style={{ fontSize: 10, color: 'var(--text4)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{f.label} leader</div>
+                </div>
+              </div>
+            </PlayerName>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        {!standings && <div style={S.card}><p style={S.empty}>Loading standings...</p></div>}
+        {conferences.map((conf, ci) => (
+          <div key={conf} style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--text)', marginBottom: 5 }}>{conf}</div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 8 }}>
+              {[...new Set(standings.filter(t => t.conference_name === conf).map(t => t.division_name))].map(div => (
+                <div key={div} style={{ background: 'var(--surface)', border: `1px solid ${LINE2}`, borderRadius: RADIUS.sm, overflow: 'hidden' }}>
+                  <div style={{ padding: '4px 8px', fontSize: 11, fontWeight: 800, color: '#fff', background: ci === 0 ? ACCENT : BRAND }}>{div}</div>
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ background: 'var(--surface2)' }}>
+                        <th style={{ ...th, textAlign: 'left', paddingLeft: 8 }}>Team</th>
+                        <th style={th}>GP</th><th style={th}>W-L-OT-SO</th><th style={th}>PTS</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {standings.filter(t => t.division_name === div).map(t => (
+                        <tr key={t.team_id} onClick={() => onTeamClick(t.team_id)} style={{ cursor: 'pointer', borderTop: `1px solid ${LINE}` }} {...rowHover}>
+                          <td style={{ ...td, textAlign: 'left', paddingLeft: 8, fontFamily: 'inherit', fontWeight: 700, color: ACCENT }}>
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                              <img src={ahlLogo(t.team_id)} style={{ width: 15, height: 15, objectFit: 'contain' }} alt="" />{t.team_code}
+                            </span>
+                          </td>
+                          <td style={td}>{t.games_played}</td>
+                          <td style={td}>{ahlRecord(t)}</td>
+                          <td style={{ ...td, fontWeight: 900, color: 'var(--text)' }}>{t.points}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+        <div style={{ ...S.card, marginTop: 8 }}>
+          <div style={S.cardLabel}><ScrollText size={13} /> Quote of the Day</div>
+          <div style={{ padding: 16 }}>
+            <p style={{ margin: 0, fontSize: 14, fontStyle: 'italic', color: 'var(--text)', lineHeight: 1.5 }}>&ldquo;{todayQuote.quote}&rdquo;</p>
+            <p style={{ margin: '8px 0 0', fontSize: 12, fontWeight: 700, color: ACCENT, textAlign: 'right' }}>— {todayQuote.author}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── AHL dashboard ──────────────────────────────────────────────────────────
+// Everything under the AHL toggle. The header's date controls, tab bar and
+// Refresh button are shared with the NHL side and passed in.
+function AhlDashboard({ tab, dateStr, refreshKey, onRefreshed, selectedTeam, onSelectTeam, onOpenTeam }) {
+  const [seasons, setSeasons] = useState([]);
+  const [seasonId, setSeasonId] = useState(null);
+  const [standings, setStandings] = useState(null);
+  const [games, setGames] = useState(null);
+  const [error, setError] = useState(null);
+  const [search, setSearch] = useState('');
+  const [selectedGame, setSelectedGame] = useState(null);
+  const [selectedPlayer, setSelectedPlayer] = useState(null);
+  const [logos, setLogos] = useState({});
+
+  const dateRef = useRef(dateStr);
+  useEffect(() => { dateRef.current = dateStr; }, [dateStr]);
+  const seasonRef = useRef(seasonId);
+  useEffect(() => { seasonRef.current = seasonId; }, [seasonId]);
+
+  const fetchGames = (date, silent = false) => {
+    if (!silent) { setGames(null); setError(null); }
+    return ahlKit('gamesbydate', { fetch_date: date })
+      .then(d => {
+        if (date !== dateRef.current) return;
+        setGames((d.Gamesbydate ?? []).map(normAhlGame));
+        onRefreshed(new Date());
+      })
+      .catch(() => { if (!silent && date === dateRef.current) { setGames([]); setError('Failed to load AHL games.'); } });
+  };
+  const fetchStandings = (sid) => ahlKit('statviewtype', { type: 'standings', stat: 'division', season_id: sid, context: 'overall', special: 'false' })
+    .then(d => { if (sid === seasonRef.current) setStandings((d.Statviewtype ?? []).filter(r => r.team_id)); })
+    .catch(() => { if (sid === seasonRef.current) setStandings([]); });
+
+  // Regular seasons only; default to the newest one that has started.
+  useEffect(() => {
+    ahlKit('seasons').then(d => {
+      const regular = (d.Seasons ?? []).filter(s => s.career === '1' && s.playoff === '0');
+      const today = localDateStr();
+      setSeasons(regular);
+      setSeasonId((regular.find(s => s.start_date <= today) ?? regular[0])?.season_id ?? null);
+    }).catch(() => setStandings([]));
+  }, []);
+
+  useEffect(() => { fetchGames(dateStr); }, [dateStr]);
+  useEffect(() => {
+    if (!seasonId) return;
+    setStandings(null);
+    fetchStandings(seasonId);
+    ahlKit('teamsbyseason', { season_id: seasonId }).then(d => {
+      const found = Object.fromEntries((d.Teamsbyseason ?? []).filter(t => t.team_logo_url).map(t => [t.id, t.team_logo_url]));
+      setLogos(prev => ({ ...found, ...prev }));
+    }).catch(() => {});
+  }, [seasonId]);
+  useEffect(() => {
+    if (!refreshKey) return;
+    fetchGames(dateRef.current);
+    if (seasonRef.current) fetchStandings(seasonRef.current);
+  }, [refreshKey]);
+
+  // Live polling, same cadence as the NHL side.
+  useEffect(() => {
+    let tick = 0;
+    const id = setInterval(() => {
+      tick += 1;
+      fetchGames(dateRef.current, true);
+      if (tick % 10 === 0 && seasonRef.current) fetchStandings(seasonRef.current);
+    }, 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const teamMap = useMemo(() => {
+    const map = {};
+    const divCount = {};
+    (standings ?? []).forEach(t => {
+      divCount[t.division_name] = (divCount[t.division_name] ?? 0) + 1;
+      map[t.team_id] = {
+        name: t.team_name, code: t.team_code, wins: t.wins, losses: t.losses, ot_losses: t.ot_losses, shootout_losses: t.shootout_losses,
+        points: t.points, division: t.division_name, conference: t.conference_name, divisionRank: divCount[t.division_name], goalDiff: Number(t.goals_diff),
+      };
+    });
+    return map;
+  }, [standings]);
+
+  const seasonPicker = seasons.length > 0 && (
+    <select value={seasonId ?? ''} onChange={e => setSeasonId(e.target.value)} aria-label="Season" style={{ ...S.dateInput, padding: '6px 8px', fontWeight: 600 }}>
+      {seasons.map(s => <option key={s.season_id} value={s.season_id}>{s.shortname}</option>)}
+    </select>
+  );
+
+  const liveSelectedGame = selectedGame ? (games?.find(g => g.id === selectedGame.id) ?? selectedGame) : null;
+  const filteredGames = (games ?? []).filter(g => {
+    if (!search.trim()) return true;
+    const q = search.toLowerCase();
+    return [g.away, g.home].some(t => (t.code ?? '').toLowerCase().includes(q) || (t.name ?? '').toLowerCase().includes(q));
+  });
+
+  return (
+    <AhlLogoContext.Provider value={logos}>
+    <PlayerClickContext.Provider value={setSelectedPlayer}>
+      {tab === 'home' && (
+        <AhlHomePage standings={standings} games={games} dateStr={dateStr} seasonId={seasonId} onGameClick={setSelectedGame} onTeamClick={onOpenTeam} />
+      )}
+
+      {tab === 'games' && (
+        <>
+          <div style={S.bodyHeader}>
+            <h2 style={S.sectionTitle}>AHL Games <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text3)' }}>· {longDate(dateStr)}</span></h2>
+            <input type="text" placeholder="Search team..." value={search} onChange={e => setSearch(e.target.value)} style={{ ...S.dateInput, padding: '6px 10px', width: 200 }} />
+          </div>
+          {!games && <p style={S.empty}>Loading games...</p>}
+          {error && <p style={{ textAlign: 'center', color: LIVE, padding: 24 }}>{error}</p>}
+          {games && !error && filteredGames.length === 0 && <p style={{ ...S.empty, padding: '60px 0' }}>No games scheduled.</p>}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 320px), 1fr))', gap: 12 }}>
+            {filteredGames.map(g => <AhlGameCard key={g.id} game={g} teamMap={teamMap} onClick={() => setSelectedGame(g)} />)}
+          </div>
+        </>
+      )}
+
+      {tab === 'standings' && <AhlStandingsPage standings={standings} seasonPicker={seasonPicker} onTeamClick={onOpenTeam} />}
+
+      {tab === 'teams' && (
+        selectedTeam
+          ? <AhlTeamDetail teamId={selectedTeam} teamMap={teamMap} seasonId={seasonId} seasonPicker={seasonPicker} onBack={() => onSelectTeam(null)} onGameClick={setSelectedGame} />
+          : (
+            <>
+              <div style={S.bodyHeader}><h2 style={S.sectionTitle}>AHL Teams</h2>{seasonPicker}</div>
+              <AhlTeamsGrid standings={standings} onSelect={onSelectTeam} />
+            </>
+          )
+      )}
+
+      {tab === 'leaders' && <AhlLeadersPage seasonId={seasonId} seasonPicker={seasonPicker} />}
+
+      {liveSelectedGame && <AhlGameModal game={liveSelectedGame} teamMap={teamMap} onClose={() => setSelectedGame(null)} />}
+      {selectedPlayer && <AhlPlayerModal playerId={selectedPlayer} onClose={() => setSelectedPlayer(null)} />}
+    </PlayerClickContext.Provider>
+    </AhlLogoContext.Provider>
+  );
+}
+
 // ─── Main App ───────────────────────────────────────────────────────────────
+const LEAGUE_KEY = 'papanhl.league';
+
 export default function App() {
+  const [league, setLeague] = useState(() => {
+    try { return localStorage.getItem(LEAGUE_KEY) === 'ahl' ? 'ahl' : 'nhl'; } catch { return 'nhl'; }
+  });
+  const [ahlRefreshKey, setAhlRefreshKey] = useState(0);
   const [mainTab, setMainTab] = useState('home');
   const [selectedDate, setSelectedDate] = useState(() => localDateStr());
   const [games, setGames] = useState(null);
@@ -1627,9 +2797,12 @@ export default function App() {
   // every 30s. A ref avoids a stale date closure inside the interval.
   const dateRef = useRef(selectedDate);
   useEffect(() => { dateRef.current = selectedDate; }, [selectedDate]);
+  const leagueRef = useRef(league);
+  useEffect(() => { leagueRef.current = league; }, [league]);
   useEffect(() => {
     let tick = 0;
     const id = setInterval(() => {
+      if (leagueRef.current !== 'nhl') return;
       tick += 1;
       fetchGames(dateRef.current, true);
       if (tick % 10 === 0) fetchStandings();
@@ -1642,6 +2815,18 @@ export default function App() {
 
   const changeDate = (days) => { setSelectedDate(d => shiftDate(d, days)); setMainTab(t => (t === 'home' ? t : 'games')); };
   const openTeam = (abbrev) => { setSelectedTeam(abbrev); setMainTab('teams'); };
+  const switchLeague = (next) => {
+    if (next === league) return;
+    setLeague(next);
+    try { localStorage.setItem(LEAGUE_KEY, next); } catch { /* storage unavailable */ }
+    setSelectedTeam(null); setSelectedGame(null); setSelectedPlayer(null); setLastRefresh(null);
+    if (next === 'ahl' && mainTab === 'boxscores') setMainTab('home');
+    if (next === 'nhl') { fetchGames(selectedDate, true); fetchStandings(); }
+  };
+  const refresh = () => {
+    if (league === 'ahl') setAhlRefreshKey(k => k + 1);
+    else { fetchGames(selectedDate); fetchStandings(); }
+  };
 
   const filteredGames = (games ?? []).filter(g => {
     if (!search.trim()) return true;
@@ -1656,7 +2841,7 @@ export default function App() {
     ['standings', <><BarChart3 size={13} /> Standings</>],
     ['teams', <><Landmark size={13} /> Teams</>],
     ['leaders', <><Trophy size={13} /> Leaders</>],
-  ];
+  ].filter(([id]) => league === 'nhl' || id !== 'boxscores');
 
   return (
     <PlayerClickContext.Provider value={setSelectedPlayer}>
@@ -1665,15 +2850,23 @@ export default function App() {
         <div style={{ position: 'sticky', top: 0, zIndex: 50, boxShadow: SHADOW.sm }}>
         <header style={S.header}>
           <div style={S.headerLeft}>
-            <NhlBadge size={22} />
+            <LeagueBadge league={league} size={22} />
             <h1 style={S.pageTitle}>Dashboard</h1>
+            <div role="group" aria-label="League" style={{ display: 'inline-flex', border: `1px solid ${LINE2}`, borderRadius: RADIUS.sm, overflow: 'hidden' }}>
+              {[['nhl', 'NHL'], ['ahl', 'AHL']].map(([id, label]) => (
+                <button key={id} onClick={() => switchLeague(id)} aria-pressed={league === id} style={{
+                  padding: '5px 12px', border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 800, letterSpacing: '0.04em',
+                  background: league === id ? (id === 'ahl' ? AHL_RED : ACCENT) : 'var(--surface)', color: league === id ? '#fff' : INK,
+                }}>{label}</button>
+              ))}
+            </div>
           </div>
           <div style={S.headerRight}>
             <button style={S.btnGray} onClick={() => changeDate(-1)}><ChevronLeft size={13} /> Yesterday</button>
             <button style={S.btnGray} onClick={() => { setSelectedDate(localDateStr()); setMainTab(t => (t === 'home' ? t : 'games')); }}><Calendar size={13} /> Today</button>
             <button style={S.btnGray} onClick={() => changeDate(1)}>Tomorrow <ChevronRight size={13} /></button>
             <input type="date" value={selectedDate} onChange={e => e.target.value && setSelectedDate(e.target.value)} style={S.dateInput} />
-            <button style={S.btnBlue} onClick={() => { fetchGames(selectedDate); fetchStandings(); }}><RefreshCw size={13} /> Refresh</button>
+            <button style={S.btnBlue} onClick={refresh}><RefreshCw size={13} /> Refresh</button>
             {lastRefresh && (
               <span style={{ fontSize: 11, color: 'var(--text4)', whiteSpace: 'nowrap' }}>
                 ↻ {lastRefresh.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' })}
@@ -1696,6 +2889,11 @@ export default function App() {
         </div>
 
         <div style={S.body}>
+          {league === 'ahl' && (
+            <AhlDashboard tab={mainTab} dateStr={selectedDate} refreshKey={ahlRefreshKey} onRefreshed={setLastRefresh}
+              selectedTeam={selectedTeam} onSelectTeam={setSelectedTeam} onOpenTeam={openTeam} />
+          )}
+          {league === 'nhl' && (<>
           {mainTab === 'home' && (
             <HomePage standings={standings} games={games} dateStr={selectedDate} teamMap={teamMap} onGameClick={setSelectedGame} onTeamClick={openTeam} />
           )}
@@ -1731,14 +2929,15 @@ export default function App() {
           )}
 
           {mainTab === 'leaders' && <LeadersPage />}
+          </>)}
 
           <p style={{ textAlign: 'center', fontSize: 10, color: 'var(--text4)', marginTop: 30, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
-            <ClipboardList size={11} /> Data from the NHL public stats API · papanhl
+            <ClipboardList size={11} /> {league === 'ahl' ? 'Data from the AHL / HockeyTech LeagueStat feed' : 'Data from the NHL public stats API'} · papanhl
           </p>
         </div>
 
-        {liveSelectedGame && <GameModal game={liveSelectedGame} teamMap={teamMap} onClose={() => setSelectedGame(null)} />}
-        {selectedPlayer && <PlayerModal playerId={selectedPlayer} onClose={() => setSelectedPlayer(null)} />}
+        {league === 'nhl' && liveSelectedGame && <GameModal game={liveSelectedGame} teamMap={teamMap} onClose={() => setSelectedGame(null)} />}
+        {league === 'nhl' && selectedPlayer && <PlayerModal playerId={selectedPlayer} onClose={() => setSelectedPlayer(null)} />}
       </div>
     </PlayerClickContext.Provider>
   );
